@@ -1,14 +1,14 @@
 version: 2
 jobs:
   build:
-    working_directory: /go/src/github.com/tomekr-securedevops/invoicer-chapter2
+    working_directory: /go/src/github.com/tomekr-securedevops/invoicer
     docker:
       - image: circleci/golang:1.8
     environment:
       GO15VENDOREXPERIMENT: 1
-    branches:
-      only:
-        - master
+    # branches:
+    #   only:
+    #     - master
     steps:
       - checkout
       - setup_remote_docker
