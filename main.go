@@ -8,13 +8,18 @@ package main
 //go:generate ./version.sh
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
@@ -59,8 +64,21 @@ func main() {
 		panic("failed to connect database")
 	}
 
+	// initialize the session store
+	iv.store = gormstore.New(db, CSRFKey)
+	quit := make(chan struct{})
+	go iv.store.PeriodicCleanup(1*time.Hour, quit)
+
 	iv.db = db
 	iv.db.AutoMigrate(&Invoice{}, &Charge{})
+	iv.db.LogMode(true)
+
+	//initialize CSRF Token
+	CSRFKey = make([]byte, 128)
+	_, err = rand.Read(CSRFKey)
+	if err != nil {
+		log.Fatal("error initializing CSRF Key:", err)
+	}
 
 	// register routes
 	r := mux.NewRouter()
@@ -78,14 +96,8 @@ func main() {
 		http.StripPrefix("/statics/", http.FileServer(http.Dir("./statics"))),
 	).Methods("GET")
 
-	log.Fatal(http.ListenAndServe(":8080",
-		HandleMiddlewares(
-			r,
-			addRequestID(),
-			logRequest(),
-			setResponseHeaders(),
-		),
-	))
+	// all set, start the http handler
+	log.Fatal(http.ListenAndServe(":8080", r))
 }
 
 type Invoice struct {
@@ -113,13 +125,13 @@ func (iv *invoicer) getInvoice(w http.ResponseWriter, r *http.Request) {
 	iv.db.First(&i1, id)
 	fmt.Printf("%+v\n", i1)
 	if i1.ID == 0 {
-		httpError(w, r, http.StatusNotFound, "No invoice id %s", vars["id"])
+		httpError(w, http.StatusNotFound, "No invoice id %s", vars["id"])
 		return
 	}
 	iv.db.Where("invoice_id = ?", i1.ID).Find(&i1.Charges)
 	jsonInvoice, err := json.Marshal(i1)
 	if err != nil {
-		httpError(w, r, http.StatusInternalServerError, "failed to retrieve invoice id %d: %s", vars["id"], err)
+		httpError(w, http.StatusInternalServerError, "failed to retrieve invoice id %s: %s", vars["id"], err)
 		return
 	}
 	w.Header().Add("Content-Type", "application/json")
@@ -134,13 +146,13 @@ func (iv *invoicer) postInvoice(w http.ResponseWriter, r *http.Request) {
 	log.Println("posting new invoice")
 	body, err := ioutil.ReadAll(r.Body)
 	if err != nil {
-		httpError(w, r, http.StatusBadRequest, "failed to read request body: %s", err)
+		httpError(w, http.StatusBadRequest, "failed to read request body: %s", err)
 		return
 	}
 	var i1 Invoice
 	err = json.Unmarshal(body, &i1)
 	if err != nil {
-		httpError(w, r, http.StatusBadRequest, "failed to parse request body: %s", err)
+		httpError(w, http.StatusBadRequest, "failed to read request body: %s", err)
 		return
 	}
 	// make sure the IDs are null before inserting
@@ -163,17 +175,17 @@ func (iv *invoicer) putInvoice(w http.ResponseWriter, r *http.Request) {
 	var i1 Invoice
 	iv.db.First(&i1, vars["id"])
 	if i1.ID == 0 {
-		httpError(w, r, http.StatusNotFound, "No invoice id %s", vars["id"])
+		httpError(w, http.StatusNotFound, "No invoice id %s", vars["id"])
 		return
 	}
 	body, err := ioutil.ReadAll(r.Body)
 	if err != nil {
-		httpError(w, r, http.StatusBadRequest, "failed to read request body: %s", err)
+		httpError(w, http.StatusBadRequest, "failed to read request body: %s", err)
 		return
 	}
 	err = json.Unmarshal(body, &i1)
 	if err != nil {
-		httpError(w, r, http.StatusBadRequest, "failed to parse request body: %s", err)
+		httpError(w, http.StatusBadRequest, "failed to parse request body: %s", err)
 		return
 	}
 	iv.db.Save(&i1)
@@ -187,6 +199,11 @@ func (iv *invoicer) putInvoice(w http.ResponseWriter, r *http.Request) {
 
 func (iv *invoicer) deleteInvoice(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
+	if !checkCSRFToken(r.Header.Get("X-CSRF-Token")) {
+		w.WriteHeader(http.StatusNotAcceptable)
+		w.Write([]byte("Invalid CSRF Token"))
+		return
+	}
 	log.Println("deleting invoice", vars["id"])
 	var i1 Invoice
 	id, _ := strconv.Atoi(vars["id"])
@@ -202,7 +219,6 @@ func (iv *invoicer) deleteInvoice(w http.ResponseWriter, r *http.Request) {
 func (iv *invoicer) getIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Add("Content-Security-Policy", "default-src 'self'; child-src 'self;")
 	w.Header().Add("X-Frame-Options", "SAMEORIGIN")
-	log.Println("serving index page")
 	w.Write([]byte(`
 <!DOCTYPE html>
 <html>
@@ -220,7 +236,8 @@ func (iv *invoicer) getIndex(w http.ResponseWriter, r *http.Request) {
         <h3>Request an invoice by ID</h3>
         <form id="invoiceGetter" method="GET">
             <label>ID :</label>
-            <input id="invoiceid" type="text" />
+            <input id="invoiceid" type="text" />j
+            <input type="hidden" name="CSRFToken" value="` + makeCSRFToken() + `">
             <input type="submit" />
         </form>
         <form id="invoiceDeleter" method="DELETE">
@@ -243,4 +260,33 @@ func getVersion(w http.ResponseWriter, r *http.Request) {
 "commit": "%s",
 "build": "https://circleci.com/gh/Securing-DevOps/invoicer/"
 }`, version, commit)))
+}
+
+func httpError(w http.ResponseWriter, errorCode int, errorMessage string, args ...interface{}) {
+	log.Printf("%d: %s", errorCode, fmt.Sprintf(errorMessage, args...))
+	http.Error(w, fmt.Sprintf(errorMessage, args...), errorCode)
+	return
+}
+
+var CSRFKey []byte
+
+func makeCSRFToken() string {
+	msg := make([]byte, 32)
+	rand.Read(msg)
+	mac := hmac.New(sha256.New, CSRFKey)
+	mac.Write(msg)
+	return base64.StdEncoding.EncodeToString(msg) + `$` + base64.StdEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func checkCSRFToken(token string) bool {
+	mac := hmac.New(sha256.New, CSRFKey)
+	tokenParts := strings.Split(token, "$")
+	if len(tokenParts) != 2 {
+		return false
+	}
+	msg, _ := base64.StdEncoding.DecodeString(tokenParts[0])
+	messageMAC, _ := base64.StdEncoding.DecodeString(tokenParts[1])
+	mac.Write([]byte(msg))
+	expectedMAC := mac.Sum(nil)
+	return hmac.Equal(messageMAC, expectedMAC)
 }
