@@ -3,7 +3,7 @@ jobs:
   build:
     working_directory: /go/src/github.com/tomekr-securedevops/invoicer
     docker:
-      - image: circleci/golang:1.8
+      - image: circleci/golang:1.9
     environment:
       GO15VENDOREXPERIMENT: 1
     branches:
